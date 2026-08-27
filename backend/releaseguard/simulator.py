@@ -32,6 +32,8 @@ class TelemetrySimulator:
         self._samples: deque[ServiceMetric] = deque()
         self._rng = random.Random(settings.simulator_seed)
         self._sequence = 0
+        self._canary_sequence = 0
+        self._stable_sequence = 0
         self._generation = controller.generation()
         self._last_emit = 0.0
 
@@ -41,6 +43,8 @@ class TelemetrySimulator:
     def reset_seed(self) -> None:
         self._rng = random.Random(self.settings.simulator_seed + self.controller.generation())
         self._sequence = 0
+        self._canary_sequence = 0
+        self._stable_sequence = 0
         self._samples.clear()
         self._generation = self.controller.generation()
         self._last_emit = 0.0
@@ -53,21 +57,26 @@ class TelemetrySimulator:
             DemoPhase.REGRESSION.value,
             DemoPhase.ROLLBACK_PENDING.value,
         }
-        # One out of every ten requests enters the canary lane during the scenario.
-        is_canary = canary_active and self._sequence % 10 == 0
+        is_canary = canary_active and self._routes_to_canary(
+            self._sequence,
+            state["canary_percent"],
+        )
         cohort = "canary" if is_canary else "stable"
         version = self.settings.canary_version if is_canary else self.settings.stable_version
         regression = is_canary and state["regression_enabled"]
 
         if regression:
+            self._canary_sequence += 1
             latency = round(max(410, self._rng.gauss(650, 72)))
-            failed = self._sequence % 50 == 0  # 20% of canary requests, exactly.
+            failed = self._canary_sequence % 5 == 0  # One in five canary requests fails.
         elif is_canary:
+            self._canary_sequence += 1
             latency = round(max(80, self._rng.gauss(154, 19)))
-            failed = self._sequence % 1310 == 0  # <1% of canary requests.
+            failed = self._canary_sequence % 131 == 0  # <1% of canary requests.
         else:
+            self._stable_sequence += 1
             latency = round(max(75, self._rng.gauss(149, 17)))
-            failed = self._sequence % 170 == 0  # ~0.6% of stable requests.
+            failed = self._stable_sequence % 170 == 0  # ~0.6% of stable requests.
 
         return ServiceMetric(
             event_id=f"req_{uuid4().hex[:20]}",
@@ -80,6 +89,11 @@ class TelemetrySimulator:
             status_code=503 if failed else 200,
             event_time=int(time.time() * 1000),
         )
+
+    @staticmethod
+    def _routes_to_canary(sequence: int, traffic_percent: int) -> bool:
+        """Spread an integer percentage evenly across each 100-request cycle."""
+        return traffic_percent > 0 and (sequence * traffic_percent) % 100 < traffic_percent
 
     async def run(self) -> None:
         batch_size = max(1, round(self.settings.events_per_second * self.settings.simulator_interval_seconds))
@@ -96,7 +110,7 @@ class TelemetrySimulator:
             now = time.monotonic()
             if now - self._last_emit >= self.settings.health_emit_seconds:
                 self._last_emit = now
-                if not self.settings.kafka_enabled or self.settings.local_decisions:
+                if not self.settings.kafka_enabled:
                     point = self.aggregate_health(source="local")
                     decision = await self.controller.record_health(point)
                     if decision:

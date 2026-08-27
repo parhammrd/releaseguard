@@ -6,9 +6,11 @@ import json
 import logging
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator
+from pathlib import Path
+from typing import Any, AsyncIterator, Protocol
+from urllib.parse import unquote
 
-from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,17 +22,41 @@ from .simulator import TelemetrySimulator
 from .state import DemoController
 
 
-settings = Settings()
-controller = DemoController(settings)
-gateway = KafkaGateway(settings, controller)
-simulator = TelemetrySimulator(settings, controller, gateway)
 logger = logging.getLogger("releaseguard.webhook")
+router = APIRouter()
+
+
+class GatewayDependency(Protocol):
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    async def publish_release_event(self, event: dict[str, Any]) -> None: ...
+
+    async def publish_metric(self, metric: Any) -> None: ...
+
+    async def publish_decision(self, decision: ReleaseDecision) -> None: ...
+
+    async def publish_action(self, action: dict[str, Any]) -> None: ...
+
+
+class SimulatorDependency(Protocol):
+    async def run(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def reset_seed(self) -> None: ...
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
+    gateway: GatewayDependency = application.state.gateway
+    simulator: SimulatorDependency = application.state.simulator
     await gateway.start()
-    simulator_task = asyncio.create_task(simulator.run(), name="releaseguard-telemetry-simulator")
+    simulator_task = asyncio.create_task(
+        simulator.run(),
+        name="releaseguard-telemetry-simulator",
+    )
     try:
         yield
     finally:
@@ -41,49 +67,27 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await gateway.close()
 
 
-app = FastAPI(
-    title="ReleaseGuard API",
-    version="1.0.0",
-    description="Real-time canary safety demo powered by Confluent Cloud.",
-    lifespan=lifespan,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
-)
-
-
-@app.middleware("http")
-async def limit_quick_tunnel_surface(request: Request, call_next):
-    """A disposable public tunnel exposes only the connector webhook and health probe."""
-    host = request.headers.get("host", "").split(":", 1)[0].lower()
-    if host.endswith(".trycloudflare.com") and not (
-        request.url.path == "/healthz"
-        or request.url.path.startswith("/api/v1/release-decisions/")
-    ):
-        return JSONResponse(status_code=404, content={"detail": "Not found"})
-    return await call_next(request)
-
-
-@app.get("/healthz")
-async def healthz() -> dict[str, Any]:
+@router.get("/healthz")
+async def healthz(request: Request) -> dict[str, Any]:
+    app_settings: Settings = request.app.state.settings
     return {
         "status": "ok",
-        "service": settings.app_name,
-        "kafka": "configured" if settings.kafka_enabled else "local-preview",
+        "service": app_settings.app_name,
+        "kafka": "configured" if app_settings.kafka_enabled else "local-preview",
     }
 
 
-@app.get("/api/demo/state")
-async def demo_state() -> dict[str, Any]:
+@router.get("/api/demo/state")
+async def demo_state(request: Request) -> dict[str, Any]:
+    controller: DemoController = request.app.state.controller
     return controller.snapshot()
 
 
-@app.post("/api/demo/reset")
-async def reset_demo() -> dict[str, Any]:
+@router.post("/api/demo/reset")
+async def reset_demo(request: Request) -> dict[str, Any]:
+    controller: DemoController = request.app.state.controller
+    gateway: GatewayDependency = request.app.state.gateway
+    simulator: SimulatorDependency = request.app.state.simulator
     snapshot = await controller.reset()
     simulator.reset_seed()
     event = snapshot["timeline"][-1]
@@ -91,28 +95,33 @@ async def reset_demo() -> dict[str, Any]:
     return snapshot
 
 
-@app.post("/api/demo/canary")
-async def launch_canary(request: CanaryRequest) -> dict[str, Any]:
+@router.post("/api/demo/canary")
+async def launch_canary(payload: CanaryRequest, request: Request) -> dict[str, Any]:
+    controller: DemoController = request.app.state.controller
+    gateway: GatewayDependency = request.app.state.gateway
     try:
-        snapshot, event = await controller.launch_canary(request.version, request.traffic_percent)
+        snapshot, event = await controller.launch_canary(payload.version, payload.traffic_percent)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await gateway.publish_release_event(event)
     return snapshot
 
 
-@app.post("/api/demo/regression")
-async def set_regression(request: RegressionRequest) -> dict[str, Any]:
+@router.post("/api/demo/regression")
+async def set_regression(payload: RegressionRequest, request: Request) -> dict[str, Any]:
+    controller: DemoController = request.app.state.controller
+    gateway: GatewayDependency = request.app.state.gateway
     try:
-        snapshot, event = await controller.set_regression(request.enabled)
+        snapshot, event = await controller.set_regression(payload.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await gateway.publish_release_event(event)
     return snapshot
 
 
-@app.get("/api/events")
+@router.get("/api/events")
 async def events(request: Request) -> StreamingResponse:
+    controller: DemoController = request.app.state.controller
     queue = await controller.hub.subscribe()
 
     async def stream() -> AsyncIterator[str]:
@@ -142,17 +151,21 @@ async def events(request: Request) -> StreamingResponse:
     )
 
 
-@app.post("/api/v1/release-decisions/{decision_id}")
+@router.post("/api/v1/release-decisions/{decision_id}")
 async def receive_release_decision(
     decision_id: str,
+    request: Request,
     payload: Any = Body(default=None),
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
-    expected = f"Bearer {settings.webhook_secret}"
+    app_settings: Settings = request.app.state.settings
+    controller: DemoController = request.app.state.controller
+    gateway: GatewayDependency = request.app.state.gateway
+    expected = f"Bearer {app_settings.webhook_secret}"
     if authorization is None or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Invalid webhook bearer token")
 
-    if decision_id not in controller._known_decisions and payload:  # webhook can win the consumer race.
+    if payload is not None:  # The webhook can win the dashboard consumer race.
         try:
             candidate = _connector_decision_payload(payload, decision_id)
             decision = ReleaseDecision.model_validate(candidate)
@@ -164,10 +177,14 @@ async def receive_release_decision(
                 exc,
             )
             raise HTTPException(status_code=422, detail=f"Invalid release decision: {exc}") from exc
-        await controller.register_external_decision(decision)
+        if not await controller.register_external_decision(decision):
+            raise HTTPException(
+                status_code=409,
+                detail="Decision is not for the current active canary",
+            )
 
     try:
-        result = await controller.apply_rollback(decision_id)
+        result = await controller.apply_rollback(decision_id, via_connector=True)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Decision has not reached ReleaseGuard") from exc
 
@@ -198,7 +215,10 @@ def _connector_decision_payload(payload: Any, decision_id: str) -> dict[str, Any
         raise ValueError("Connector body must contain one decision object")
 
     normalized = dict(candidate)
-    normalized["decision_id"] = decision_id
+    body_decision_id = normalized.get("decision_id")
+    if body_decision_id is not None and body_decision_id != decision_id:
+        raise ValueError("URL decision_id does not match the connector body")
+    normalized.setdefault("decision_id", decision_id)
     decided_at = normalized.get("decided_at")
     if isinstance(decided_at, (int, float)):
         normalized["decided_at"] = (
@@ -207,31 +227,137 @@ def _connector_decision_payload(payload: Any, decision_id: str) -> dict[str, Any
     return normalized
 
 
-def _mount_frontend() -> None:
-    dist = settings.frontend_dist
+def _resolve_frontend_file(dist: Path, relative_path: str) -> Path | None:
+    """Resolve a frontend file without allowing URL or symlink traversal."""
+    decoded = relative_path
+    for _ in range(12):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    normalized = decoded.replace("\\", "/")
+    if "\x00" in normalized or normalized.startswith("/") or ".." in normalized.split("/"):
+        raise ValueError("Frontend path leaves the export directory")
+
+    root = dist.resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Frontend path leaves the export directory") from exc
+    return candidate if candidate.is_file() else None
+
+
+def _mount_frontend(target_app: FastAPI, dist: Path) -> None:
     if not dist.exists():
         return
     assets = dist / "_next"
     if assets.exists():
-        app.mount("/_next", StaticFiles(directory=assets), name="next-assets")
+        assets_root = assets.resolve()
+        try:
+            assets_root.relative_to(dist.resolve())
+        except ValueError:
+            pass
+        else:
+            if assets_root.is_dir():
+                target_app.mount(
+                    "/_next",
+                    StaticFiles(directory=assets_root),
+                    name="next-assets",
+                )
     for static_name in ("favicon.svg", "favicon.ico"):
-        file_path = dist / static_name
-        if file_path.exists():
-            app.add_api_route(
+        try:
+            file_path = _resolve_frontend_file(dist, static_name)
+        except ValueError:
+            continue
+        if file_path is not None:
+            target_app.add_api_route(
                 f"/{static_name}",
                 lambda path=file_path: FileResponse(path),
                 include_in_schema=False,
             )
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    @target_app.get("/{full_path:path}", include_in_schema=False)
     async def frontend(full_path: str) -> FileResponse:
-        candidate = dist / full_path
-        if candidate.is_file():
-            return FileResponse(candidate)
-        nested_index = candidate / "index.html"
-        if nested_index.is_file():
-            return FileResponse(nested_index)
-        return FileResponse(dist / "index.html")
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        try:
+            candidate = _resolve_frontend_file(dist, full_path)
+            if candidate is not None:
+                return FileResponse(candidate)
+            nested_path = "index.html" if not full_path else f"{full_path.rstrip('/')}/index.html"
+            nested_index = _resolve_frontend_file(dist, nested_path)
+            if nested_index is not None:
+                return FileResponse(nested_index)
+            index = _resolve_frontend_file(dist, "index.html")
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Not found") from exc
+        if index is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(index)
 
 
-_mount_frontend()
+def create_app(
+    app_settings: Settings | None = None,
+    *,
+    controller: DemoController | None = None,
+    gateway: GatewayDependency | None = None,
+    simulator: SimulatorDependency | None = None,
+    serve_frontend: bool = True,
+) -> FastAPI:
+    """Build an isolated application with optional runtime dependencies."""
+    resolved_settings = app_settings or Settings()
+    resolved_controller = controller or DemoController(resolved_settings)
+    resolved_gateway = gateway or KafkaGateway(resolved_settings, resolved_controller)
+    resolved_simulator = simulator or TelemetrySimulator(
+        resolved_settings,
+        resolved_controller,
+        resolved_gateway,
+    )
+
+    application = FastAPI(
+        title="ReleaseGuard API",
+        version="1.0.0",
+        description="Real-time canary release safety demonstration.",
+        lifespan=_lifespan,
+    )
+    application.state.settings = resolved_settings
+    application.state.controller = resolved_controller
+    application.state.gateway = resolved_gateway
+    application.state.simulator = resolved_simulator
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+    )
+
+    @application.middleware("http")
+    async def limit_quick_tunnel_surface(request: Request, call_next):
+        """Expose only the connector webhook and health probe through Quick Tunnels."""
+        host = request.headers.get("host", "").split(":", 1)[0].lower()
+        if host.endswith(".trycloudflare.com") and not (
+            request.url.path == "/healthz"
+            or request.url.path.startswith("/api/v1/release-decisions/")
+        ):
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
+        return await call_next(request)
+
+    application.include_router(router)
+    if serve_frontend:
+        _mount_frontend(application, resolved_settings.frontend_dist)
+    return application
+
+
+# Uvicorn and the container keep using `releaseguard.app:app`.
+settings = Settings()
+controller = DemoController(settings)
+gateway = KafkaGateway(settings, controller)
+simulator = TelemetrySimulator(settings, controller, gateway)
+app = create_app(
+    settings,
+    controller=controller,
+    gateway=gateway,
+    simulator=simulator,
+)

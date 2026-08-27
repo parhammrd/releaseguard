@@ -392,7 +392,7 @@ resource "confluent_connector" "http_sink" {
     "api1.retry.on.status.codes"                    = "408,429,500-"
     "auto.restart.on.user.error"                    = "true"
     "errors.tolerance"                              = "all"
-    "behavior.on.error"                             = "FAIL"
+    "behavior.on.error"                             = "IGNORE"
     "report.errors.as"                              = "http_response"
     "reporter.result.topic.name"                    = "releaseguard_http_success"
     "reporter.error.topic.name"                     = "releaseguard_http_error"

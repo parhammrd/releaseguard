@@ -1,0 +1,20 @@
+flowchart LR
+  UI[ReleaseGuard dashboard] --> API[FastAPI demo controller]
+  API --> M[(releaseguard_service_metrics)]
+  API --> E[(releaseguard_release_events)]
+  M --> W[Flink · 6s HOP / 2s]
+  W --> H[(releaseguard_window_health)]
+  H --> P[Flink · stable/canary policy]
+  P --> D[(releaseguard_release_decisions)]
+  D --> S[HTTP Sink V2]
+  S --> T[Cloudflare Quick Tunnel]
+  T --> WH[Bearer-authenticated webhook]
+  WH --> A[Simulated traffic allocation · 10% to 0%]
+  WH --> R[(releaseguard_action_results)]
+  A --> UI
+  SR[Schema Registry · BACKWARD_TRANSITIVE] -. governs .-> M
+  SR -. governs .-> H
+  SR -. governs .-> D
+  L[Stream Lineage] -. traces .-> W
+  L -. traces .-> P
+  L -. traces .-> S

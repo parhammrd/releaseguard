@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'ReleaseGuard — Real-time canary safety',
-  description: 'Ship faster with a streaming safety net powered by Confluent.',
+  description: 'Canary-release monitoring demo built with Confluent and Flink.',
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

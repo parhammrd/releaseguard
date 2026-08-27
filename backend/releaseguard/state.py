@@ -63,6 +63,11 @@ class DemoController:
         self.rollback_at: str | None = None
         self.latest_decision: dict[str, Any] | None = None
         self.latest_action: dict[str, Any] | None = None
+        self._canary_allocation_percent = 0
+        self._observed_health_source: str | None = None
+        self._flink_health_observed = False
+        self._flink_decision_observed = False
+        self._connector_delivery_observed = False
         self.total_requests = 0
         self.canary_requests = 0
         self.canary_errors = 0
@@ -74,8 +79,8 @@ class DemoController:
         self._known_decisions.clear()
         self._add_timeline(
             "system_ready",
-            "Production healthy",
-            f"{self.settings.stable_version} is serving 100% of traffic",
+            "Stable baseline healthy",
+            f"{self.settings.stable_version} is serving all simulated requests",
             "green",
         )
 
@@ -104,7 +109,12 @@ class DemoController:
         recovery_time = self._duration(self.decision_at, self.rollback_at)
         # Scenario estimates compare automation with a five-minute manual response.
         remaining_manual_seconds = max(0.0, 300.0 - (time_to_detect or 0.0) - (recovery_time or 0.0))
-        projected_canary_requests = remaining_manual_seconds * self.settings.events_per_second * 0.10
+        projected_canary_requests = (
+            remaining_manual_seconds
+            * self.settings.events_per_second
+            * self._canary_allocation_percent
+            / 100
+        )
         error_delta = max(0.0, 0.20 - 0.008)
         errors_avoided = round(projected_canary_requests * error_delta)
         sessions_protected = round(projected_canary_requests)
@@ -138,8 +148,11 @@ class DemoController:
             },
             "pipeline": {
                 "mode": "confluent" if self.settings.kafka_enabled else "local_preview",
-                "health_source": "flink" if self.settings.kafka_enabled else "deterministic_local_twin",
-                "connector_delivery": self.settings.kafka_enabled,
+                "configured_mode": "confluent" if self.settings.kafka_enabled else "local_preview",
+                "health_source": self._observed_health_source or "not_observed",
+                "flink_health_observed": self._flink_health_observed,
+                "flink_decision_observed": self._flink_decision_observed,
+                "connector_delivery": self._connector_delivery_observed,
             },
         }
 
@@ -174,11 +187,12 @@ class DemoController:
                 self._initialize()
             self.phase = DemoPhase.CANARY_RUNNING
             self.canary_percent = traffic_percent
+            self._canary_allocation_percent = traffic_percent
             self.started_at = now_iso()
             event = self._add_timeline(
                 "canary_launched",
                 f"Canary {version} launched",
-                f"{traffic_percent}% of production traffic",
+                f"{traffic_percent}% of simulated requests",
                 "violet",
                 {"traffic_percent": traffic_percent, "version": version},
             )
@@ -226,7 +240,21 @@ class DemoController:
                 return None
             payload = point.model_dump()
             self.health_history.append(payload)
-            if self.phase is DemoPhase.REGRESSION and self._threshold_breached(point):
+            self._observed_health_source = (
+                "flink" if point.source == "flink" else "deterministic_local_twin"
+            )
+            if point.source == "flink":
+                self._flink_health_observed = True
+            local_evaluator_enabled = (
+                self.settings.local_decisions
+                and not self.settings.kafka_enabled
+                and point.source == "local"
+            )
+            if (
+                local_evaluator_enabled
+                and self.phase is DemoPhase.REGRESSION
+                and self._threshold_breached(point)
+            ):
                 decision = self._make_decision(point)
                 self._known_decisions[decision.decision_id] = decision
                 self.latest_decision = decision.model_dump()
@@ -234,7 +262,7 @@ class DemoController:
                 self.decision_at = decision.decided_at
                 self._add_timeline(
                     "rollback_decision",
-                    "Flink emitted ROLLBACK",
+                    "Local evaluator emitted ROLLBACK",
                     decision.reason,
                     "red",
                     {"decision_id": decision.decision_id},
@@ -292,28 +320,64 @@ class DemoController:
 
     async def register_external_decision(self, decision: ReleaseDecision) -> bool:
         async with self._lock:
-            if decision.decision_id not in self._known_decisions:
-                self._known_decisions[decision.decision_id] = decision
-            accepted = decision.release_id == self.release_id and self.phase in {
-                DemoPhase.CANARY_RUNNING,
-                DemoPhase.REGRESSION,
-                DemoPhase.ROLLBACK_PENDING,
-            }
-            if accepted and self.phase is not DemoPhase.ROLLED_BACK:
+            existing = self._known_decisions.get(decision.decision_id)
+            if existing is not None:
+                same_decision = existing.model_dump() == decision.model_dump()
+                accepted = same_decision and (
+                    decision.decision_id in self._processed_decisions
+                    or (
+                        decision.release_id == self.release_id
+                        and self.canary_percent > 0
+                        and self.phase is DemoPhase.ROLLBACK_PENDING
+                    )
+                )
+                snapshot = self.snapshot()
+                is_new = False
+            else:
+                matches_current_release = (
+                    decision.release_id == self.release_id
+                    and decision.source == "flink"
+                )
+                starts_rollback = (
+                    matches_current_release
+                    and self.canary_percent > 0
+                    and self.phase in {DemoPhase.CANARY_RUNNING, DemoPhase.REGRESSION}
+                )
+                follows_existing_rollback = matches_current_release and self.phase in {
+                    DemoPhase.ROLLBACK_PENDING,
+                    DemoPhase.ROLLED_BACK,
+                }
+                accepted = starts_rollback or follows_existing_rollback
+                is_new = starts_rollback
+                if accepted:
+                    # Flink can emit another qualifying decision in each hopping
+                    # window. Remember it so HTTP Sink receives a 2xx duplicate
+                    # response instead of stopping on an expected later window.
+                    self._known_decisions[decision.decision_id] = decision
+            if is_new:
                 self.latest_decision = decision.model_dump()
                 self.phase = DemoPhase.ROLLBACK_PENDING
                 self.decision_at = decision.decided_at
-                self._add_timeline("rollback_decision", "Flink emitted ROLLBACK", decision.reason, "red")
-            snapshot = self.snapshot()
-        if accepted:
+                self._flink_decision_observed = decision.source == "flink"
+                self._add_timeline(
+                    "rollback_decision",
+                    "Flink emitted ROLLBACK",
+                    decision.reason,
+                    "red",
+                    {"decision_id": decision.decision_id},
+                )
+                snapshot = self.snapshot()
+        if is_new:
             await self.hub.publish("decision", decision.model_dump())
             await self.hub.publish("snapshot", snapshot)
         return accepted
 
-    async def apply_rollback(self, decision_id: str) -> ActionResult:
+    async def apply_rollback(self, decision_id: str, *, via_connector: bool = False) -> ActionResult:
         async with self._lock:
             existing = self._processed_decisions.get(decision_id)
             if existing:
+                if via_connector:
+                    self._connector_delivery_observed = True
                 return ActionResult(
                     **{
                         **existing.model_dump(),
@@ -324,11 +388,11 @@ class DemoController:
             decision = self._known_decisions.get(decision_id)
             if not decision:
                 raise KeyError("Unknown decision_id")
-            if decision.release_id != self.release_id or self.phase not in {
-                DemoPhase.CANARY_RUNNING,
-                DemoPhase.REGRESSION,
-                DemoPhase.ROLLBACK_PENDING,
-            }:
+            if (
+                decision.release_id != self.release_id
+                or self.canary_percent <= 0
+                or self.phase is not DemoPhase.ROLLBACK_PENDING
+            ):
                 result = ActionResult(
                     action_id=f"act_{uuid4().hex[:16]}",
                     decision_id=decision_id,
@@ -341,6 +405,8 @@ class DemoController:
                 )
                 self._processed_decisions[decision_id] = result
                 return result
+            if via_connector:
+                self._connector_delivery_observed = True
             previous = self.canary_percent
             self.canary_percent = 0
             self.regression_enabled = False
