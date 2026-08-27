@@ -1,0 +1,11 @@
+.git
+.venv
+.next
+node_modules
+out
+.env*
+infra/terraform/.terraform
+infra/terraform/*.tfstate*
+docs/screenshots
+__pycache__
+.pytest_cache

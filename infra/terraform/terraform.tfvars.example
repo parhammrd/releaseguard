@@ -1,0 +1,8 @@
+# Supply the Global key and secret via TF_VAR_confluent_cloud_api_key and
+# TF_VAR_confluent_cloud_api_secret. Never paste them into this file.
+environment_id       = "env-v91nqz"
+kafka_cluster_id     = "lkc-nvxppj3"
+flink_compute_pool_id = "lfcp-38w66xm"
+
+enable_flink    = true
+enable_http_sink = false

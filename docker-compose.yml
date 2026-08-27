@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    container_name: releaseguard_app
+    env_file:
+      - .env.local
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: releaseguard_tunnel
+    command: tunnel --no-autoupdate --url http://app:8000
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped

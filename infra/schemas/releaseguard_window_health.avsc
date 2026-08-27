@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "WindowHealth",
+  "namespace": "io.releaseguard",
+  "fields": [
+    {"name":"release_id","type":"string"},
+    {"name":"window_start","type":{"type":"long","logicalType":"local-timestamp-millis"}},
+    {"name":"window_end","type":{"type":"long","logicalType":"local-timestamp-millis"}},
+    {"name":"stable_request_count","type":"long"},
+    {"name":"stable_error_count","type":"long"},
+    {"name":"stable_error_rate","type":"double"},
+    {"name":"stable_avg_latency_ms","type":"double"},
+    {"name":"canary_request_count","type":"long"},
+    {"name":"canary_error_count","type":"long"},
+    {"name":"canary_error_rate","type":"double"},
+    {"name":"canary_avg_latency_ms","type":"double"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "ReleaseEvent",
+  "namespace": "io.releaseguard",
+  "fields": [
+    {"name":"event_id","type":"string"},
+    {"name":"release_id","type":"string"},
+    {"name":"event_type","type":"string"},
+    {"name":"version","type":"string"},
+    {"name":"traffic_percent","type":"int"},
+    {"name":"occurred_at","type":{"type":"long","logicalType":"timestamp-millis"}},
+    {"name":"detail","type":"string"}
+  ]
+}

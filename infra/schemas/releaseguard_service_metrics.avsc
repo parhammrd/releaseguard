@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "ServiceMetric",
+  "namespace": "io.releaseguard",
+  "fields": [
+    {"name":"event_id","type":"string"},
+    {"name":"release_id","type":"string"},
+    {"name":"service","type":"string"},
+    {"name":"version","type":"string"},
+    {"name":"cohort","type":{"type":"enum","name":"Cohort","symbols":["stable","canary"]}},
+    {"name":"region","type":"string"},
+    {"name":"latency_ms","type":"int"},
+    {"name":"status_code","type":"int"},
+    {"name":"event_time","type":{"type":"long","logicalType":"timestamp-millis"}}
+  ]
+}

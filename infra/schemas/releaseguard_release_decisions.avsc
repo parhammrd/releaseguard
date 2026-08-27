@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "ReleaseDecision",
+  "namespace": "io.releaseguard",
+  "fields": [
+    {"name":"decision_id","type":"string"},
+    {"name":"release_id","type":"string"},
+    {"name":"decision","type":{"type":"enum","name":"Decision","symbols":["ROLLBACK"]}},
+    {"name":"reason_code","type":"string"},
+    {"name":"reason","type":"string"},
+    {"name":"stable_error_rate","type":"double"},
+    {"name":"canary_error_rate","type":"double"},
+    {"name":"stable_avg_latency_ms","type":"double"},
+    {"name":"canary_avg_latency_ms","type":"double"},
+    {"name":"decided_at","type":{"type":"long","logicalType":"timestamp-millis"}},
+    {"name":"source","type":"string","default":"flink"}
+  ]
+}

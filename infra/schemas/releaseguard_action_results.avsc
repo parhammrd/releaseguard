@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "ActionResult",
+  "namespace": "io.releaseguard",
+  "fields": [
+    {"name":"action_id","type":"string"},
+    {"name":"decision_id","type":"string"},
+    {"name":"release_id","type":"string"},
+    {"name":"status","type":{"type":"enum","name":"ActionStatus","symbols":["applied","duplicate","failed"]}},
+    {"name":"action","type":"string"},
+    {"name":"previous_canary_percent","type":"int"},
+    {"name":"canary_percent","type":"int"},
+    {"name":"applied_at","type":{"type":"long","logicalType":"timestamp-millis"}},
+    {"name":"detail","type":"string"}
+  ]
+}
