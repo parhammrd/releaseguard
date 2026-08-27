@@ -74,6 +74,7 @@ class KafkaGateway:
                 "group.id": self.settings.consumer_group,
                 "auto.offset.reset": "latest",
                 "enable.auto.commit": True,
+                "isolation.level": "read_uncommitted",
             }
         )
         self._consumer.subscribe([self.settings.health_topic, self.settings.decisions_topic])
@@ -102,13 +103,15 @@ class KafkaGateway:
             )
         else:
             key_bytes = key.encode("utf-8")
-        self._producer.produce(
-            topic=topic,
-            key=key_bytes,
-            value=value_bytes,
-            timestamp=timestamp,
-            on_delivery=lambda error, message: None,
-        )
+        produce_args = {
+            "topic": topic,
+            "key": key_bytes,
+            "value": value_bytes,
+            "on_delivery": lambda error, message: None,
+        }
+        if timestamp is not None:
+            produce_args["timestamp"] = timestamp
+        self._producer.produce(**produce_args)
         self._producer.poll(0)
 
     async def publish_metric(self, metric: ServiceMetric) -> None:
@@ -208,6 +211,10 @@ def _decision_from_flink(payload: dict[str, Any]) -> ReleaseDecision:
     from datetime import UTC, datetime
 
     decided = payload.get("decided_at")
-    if isinstance(decided, (int, float)):
+    if isinstance(decided, datetime):
+        if decided.tzinfo is None:
+            decided = decided.replace(tzinfo=UTC)
+        decided = decided.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    elif isinstance(decided, (int, float)):
         decided = datetime.fromtimestamp(decided / 1000, UTC).isoformat().replace("+00:00", "Z")
     return ReleaseDecision(**{**payload, "decided_at": decided, "source": "flink"})

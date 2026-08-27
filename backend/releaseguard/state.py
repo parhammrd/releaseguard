@@ -53,7 +53,7 @@ class DemoController:
 
     def _initialize(self) -> None:
         self._generation += 1
-        self.release_id = f"release-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+        self.release_id = f"release-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}"
         self.phase = DemoPhase.READY
         self.canary_percent = 0
         self.regression_enabled = False
@@ -149,7 +149,10 @@ class DemoController:
             return None
         started = datetime.fromisoformat(start.replace("Z", "+00:00"))
         finished = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        return round((finished - started).total_seconds(), 1)
+        # Flink and the local webhook can differ by a few hundred milliseconds.
+        # A duration is never meaningfully negative, so keep clock skew out of
+        # the impact cards while preserving the original event timestamps.
+        return round(max(0.0, (finished - started).total_seconds()), 1)
 
     async def _broadcast_snapshot(self) -> None:
         await self.hub.publish("snapshot", self.snapshot())
@@ -219,6 +222,8 @@ class DemoController:
     async def record_health(self, point: HealthPoint) -> ReleaseDecision | None:
         decision: ReleaseDecision | None = None
         async with self._lock:
+            if point.release_id != self.release_id:
+                return None
             payload = point.model_dump()
             self.health_history.append(payload)
             if self.phase is DemoPhase.REGRESSION and self._threshold_breached(point):
@@ -285,18 +290,25 @@ class DemoController:
             source="flink" if point.source == "flink" else "local-flink-twin",
         )
 
-    async def register_external_decision(self, decision: ReleaseDecision) -> None:
+    async def register_external_decision(self, decision: ReleaseDecision) -> bool:
         async with self._lock:
             if decision.decision_id not in self._known_decisions:
                 self._known_decisions[decision.decision_id] = decision
-                if self.phase is not DemoPhase.ROLLED_BACK:
-                    self.latest_decision = decision.model_dump()
-                    self.phase = DemoPhase.ROLLBACK_PENDING
-                    self.decision_at = decision.decided_at
-                    self._add_timeline("rollback_decision", "Flink emitted ROLLBACK", decision.reason, "red")
+            accepted = decision.release_id == self.release_id and self.phase in {
+                DemoPhase.CANARY_RUNNING,
+                DemoPhase.REGRESSION,
+                DemoPhase.ROLLBACK_PENDING,
+            }
+            if accepted and self.phase is not DemoPhase.ROLLED_BACK:
+                self.latest_decision = decision.model_dump()
+                self.phase = DemoPhase.ROLLBACK_PENDING
+                self.decision_at = decision.decided_at
+                self._add_timeline("rollback_decision", "Flink emitted ROLLBACK", decision.reason, "red")
             snapshot = self.snapshot()
-        await self.hub.publish("decision", decision.model_dump())
-        await self.hub.publish("snapshot", snapshot)
+        if accepted:
+            await self.hub.publish("decision", decision.model_dump())
+            await self.hub.publish("snapshot", snapshot)
+        return accepted
 
     async def apply_rollback(self, decision_id: str) -> ActionResult:
         async with self._lock:
@@ -312,16 +324,23 @@ class DemoController:
             decision = self._known_decisions.get(decision_id)
             if not decision:
                 raise KeyError("Unknown decision_id")
-            if self.phase is DemoPhase.ROLLED_BACK and self.latest_action:
-                first = ActionResult.model_validate(self.latest_action)
-                return ActionResult(
-                    **{
-                        **first.model_dump(),
-                        "decision_id": decision_id,
-                        "status": "duplicate",
-                        "detail": "This release was already rolled back; no second traffic change was made.",
-                    }
+            if decision.release_id != self.release_id or self.phase not in {
+                DemoPhase.CANARY_RUNNING,
+                DemoPhase.REGRESSION,
+                DemoPhase.ROLLBACK_PENDING,
+            }:
+                result = ActionResult(
+                    action_id=f"act_{uuid4().hex[:16]}",
+                    decision_id=decision_id,
+                    release_id=decision.release_id,
+                    status="duplicate",
+                    previous_canary_percent=self.canary_percent,
+                    canary_percent=self.canary_percent,
+                    applied_at=now_iso(),
+                    detail="Decision belongs to an inactive or previous demo run; no traffic change was made.",
                 )
+                self._processed_decisions[decision_id] = result
+                return result
             previous = self.canary_percent
             self.canary_percent = 0
             self.regression_enabled = False

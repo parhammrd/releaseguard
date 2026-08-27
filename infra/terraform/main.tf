@@ -153,6 +153,15 @@ resource "confluent_role_binding" "runtime_group_read" {
   crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/group=releaseguard_*"
 }
 
+# Managed sink offsets use Confluent-owned connect-lcc-* group names. ResourceOwner
+# supplies the READ, DESCRIBE, and DELETE permissions required for offset management.
+resource "confluent_role_binding" "connector_group_owner" {
+  count       = var.enable_http_sink ? 1 : 0
+  principal   = "User:${confluent_service_account.runtime.id}"
+  role_name   = "ResourceOwner"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/group=connect-lcc-*"
+}
+
 resource "confluent_api_key" "manager_kafka" {
   display_name = "releaseguard_manager_kafka"
   owner {
@@ -300,7 +309,7 @@ resource "confluent_subject_config" "decision_key" {
 
 resource "confluent_flink_statement" "window_health" {
   count          = var.enable_flink ? 1 : 0
-  statement_name = "releaseguard_window_health_v1"
+  statement_name = "releaseguard-window-health-v1"
   organization { id = data.confluent_organization.current.id }
   environment { id = var.environment_id }
   compute_pool { id = confluent_flink_compute_pool.target.id }
@@ -330,7 +339,7 @@ resource "confluent_flink_statement" "window_health" {
 
 resource "confluent_flink_statement" "release_decisions" {
   count          = var.enable_flink ? 1 : 0
-  statement_name = "releaseguard_release_decisions_v1"
+  statement_name = "releaseguard-release-decisions-v1"
   organization { id = data.confluent_organization.current.id }
   environment { id = var.environment_id }
   compute_pool { id = confluent_flink_compute_pool.target.id }
@@ -369,7 +378,8 @@ resource "confluent_connector" "http_sink" {
     "http.api.base.url"                             = trimsuffix(var.public_backend_base_url, "/")
     "auth.type"                                     = "BEARER"
     "https.host.verifier.enabled"                   = "true"
-    "api1.http.api.path"                            = "/api/v1/release-decisions/$${key}"
+    "api1.http.api.path"                            = "/api/v1/release-decisions/{decisionId}?source=$${topic}"
+    "api1.http.path.parameters"                     = "decisionId:$${decision_id}"
     "api1.http.request.method"                      = "POST"
     "api1.request.body.format"                      = "JSON"
     "api1.max.batch.size"                           = "1"
@@ -377,16 +387,19 @@ resource "confluent_connector" "http_sink" {
     "api1.http.connect.timeout.ms"                  = "5000"
     "api1.http.request.timeout.ms"                  = "5000"
     "api1.max.retries"                              = "3"
-    "api1.retry.backoff.ms"                         = "500"
+    "api1.retry.backoff.ms"                         = "750"
     "api1.retry.backoff.policy"                     = "EXPONENTIAL_WITH_JITTER"
     "api1.retry.on.status.codes"                    = "408,429,500-"
+    "auto.restart.on.user.error"                    = "true"
     "errors.tolerance"                              = "all"
     "behavior.on.error"                             = "FAIL"
+    "report.errors.as"                              = "http_response"
     "reporter.result.topic.name"                    = "releaseguard_http_success"
     "reporter.error.topic.name"                     = "releaseguard_http_error"
     "errors.deadletterqueue.topic.name"             = "releaseguard_http_dlq"
     "api1.report.only.status.code.to.success.topic" = "true"
     "consumer.override.auto.offset.reset"           = "latest"
+    "consumer.override.isolation.level"             = "read_uncommitted"
     "tasks.max"                                     = "1"
   }
   lifecycle {
@@ -399,5 +412,9 @@ resource "confluent_connector" "http_sink" {
       error_message = "HTTP Sink V2 requires the ReleaseGuard Flink statements."
     }
   }
-  depends_on = [confluent_flink_statement.release_decisions, confluent_kafka_topic.releaseguard]
+  depends_on = [
+    confluent_flink_statement.release_decisions,
+    confluent_kafka_topic.releaseguard,
+    confluent_role_binding.connector_group_owner,
+  ]
 }

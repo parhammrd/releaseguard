@@ -18,7 +18,7 @@ output "resource_summary" {
     kafka_cluster_id = confluent_kafka_cluster.target.id
     flink_pool_id    = confluent_flink_compute_pool.target.id
     topics           = sort(keys(local.all_topics))
-    flink_statements = var.enable_flink ? ["releaseguard_window_health_v1", "releaseguard_release_decisions_v1"] : []
+    flink_statements = var.enable_flink ? ["releaseguard-window-health-v1", "releaseguard-release-decisions-v1"] : []
     connector        = var.enable_http_sink ? "releaseguard_http_sink_v2" : null
   }
 }

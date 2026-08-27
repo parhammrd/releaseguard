@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -22,6 +24,7 @@ settings = Settings()
 controller = DemoController(settings)
 gateway = KafkaGateway(settings, controller)
 simulator = TelemetrySimulator(settings, controller, gateway)
+logger = logging.getLogger("releaseguard.webhook")
 
 
 @asynccontextmanager
@@ -142,7 +145,7 @@ async def events(request: Request) -> StreamingResponse:
 @app.post("/api/v1/release-decisions/{decision_id}")
 async def receive_release_decision(
     decision_id: str,
-    payload: dict[str, Any] | None = Body(default=None),
+    payload: Any = Body(default=None),
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
     expected = f"Bearer {settings.webhook_secret}"
@@ -150,11 +153,16 @@ async def receive_release_decision(
         raise HTTPException(status_code=401, detail="Invalid webhook bearer token")
 
     if decision_id not in controller._known_decisions and payload:  # webhook can win the consumer race.
-        candidate = payload.get("value", payload)
-        candidate["decision_id"] = decision_id
         try:
+            candidate = _connector_decision_payload(payload, decision_id)
             decision = ReleaseDecision.model_validate(candidate)
         except Exception as exc:
+            logger.warning(
+                "Rejected connector decision %s (%s): %s",
+                decision_id,
+                type(payload).__name__,
+                exc,
+            )
             raise HTTPException(status_code=422, detail=f"Invalid release decision: {exc}") from exc
         await controller.register_external_decision(decision)
 
@@ -165,6 +173,38 @@ async def receive_release_decision(
 
     await gateway.publish_action(result.model_dump())
     return JSONResponse(status_code=200, content=result.model_dump())
+
+
+def _connector_decision_payload(payload: Any, decision_id: str) -> dict[str, Any]:
+    candidate = payload
+    for _ in range(4):
+        if isinstance(candidate, (bytes, bytearray)):
+            candidate = candidate.decode("utf-8")
+            continue
+        if isinstance(candidate, str):
+            candidate = json.loads(candidate)
+            continue
+        if isinstance(candidate, list) and len(candidate) == 1:
+            candidate = candidate[0]
+            continue
+        if isinstance(candidate, dict) and "value" in candidate:
+            candidate = candidate["value"]
+            continue
+        if isinstance(candidate, dict) and "payload" in candidate:
+            candidate = candidate["payload"]
+            continue
+        break
+    if not isinstance(candidate, dict):
+        raise ValueError("Connector body must contain one decision object")
+
+    normalized = dict(candidate)
+    normalized["decision_id"] = decision_id
+    decided_at = normalized.get("decided_at")
+    if isinstance(decided_at, (int, float)):
+        normalized["decided_at"] = (
+            datetime.fromtimestamp(decided_at / 1000, UTC).isoformat().replace("+00:00", "Z")
+        )
+    return normalized
 
 
 def _mount_frontend() -> None:

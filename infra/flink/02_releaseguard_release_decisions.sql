@@ -36,6 +36,10 @@ SELECT
   CURRENT_ROW_TIMESTAMP(),
   'flink'
 FROM `releaseguard_window_health`
+/*+ OPTIONS(
+  'kafka.consumer.isolation-level' = 'read-uncommitted',
+  'scan.startup.mode' = 'latest-offset'
+) */
 WHERE
   `stable_request_count` >= 50
   AND `canary_request_count` >= 10
