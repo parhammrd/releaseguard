@@ -4,23 +4,36 @@ data "confluent_environment" "target" {
   id = var.environment_id
 }
 
-data "confluent_kafka_cluster" "target" {
-  id = var.kafka_cluster_id
-  environment { id = var.environment_id }
+resource "confluent_kafka_cluster" "target" {
+  display_name = "releaseguard"
+  availability = "SINGLE_ZONE"
+  cloud        = var.cloud
+  region       = var.region
+  standard {}
+  environment { id = data.confluent_environment.target.id }
+}
+
+resource "confluent_flink_compute_pool" "target" {
+  display_name = "releaseguard_default"
+  cloud        = confluent_kafka_cluster.target.cloud
+  region       = confluent_kafka_cluster.target.region
+  max_cfu      = var.flink_max_cfu
+  environment { id = data.confluent_environment.target.id }
 }
 
 data "confluent_schema_registry_cluster" "target" {
   environment { id = var.environment_id }
+  depends_on = [confluent_kafka_cluster.target]
 }
 
 data "confluent_flink_region" "target" {
-  cloud  = data.confluent_kafka_cluster.target.cloud
-  region = data.confluent_kafka_cluster.target.region
+  cloud  = confluent_kafka_cluster.target.cloud
+  region = confluent_kafka_cluster.target.region
 }
 
 locals {
   app_topics = {
-    releaseguard_service_metrics   = { partitions = 3, retention = "86400000" }
+    releaseguard_service_metrics   = { partitions = 1, retention = "86400000" }
     releaseguard_release_events    = { partitions = 1, retention = "604800000" }
     releaseguard_window_health     = { partitions = 1, retention = "86400000" }
     releaseguard_release_decisions = { partitions = 1, retention = "604800000" }
@@ -44,7 +57,7 @@ locals {
 # The Global key creates these identities and scoped keys only. Runtime code never receives it.
 resource "confluent_service_account" "manager" {
   display_name = "releaseguard_manager"
-  description  = "Bootstraps only ReleaseGuard topics and schemas in the existing environment"
+  description  = "Bootstraps only ReleaseGuard topics and schemas"
 }
 
 resource "confluent_service_account" "runtime" {
@@ -59,7 +72,7 @@ resource "confluent_service_account" "flink_app" {
 
 resource "confluent_service_account" "flink_deployer" {
   display_name = "releaseguard_flink_deployer"
-  description  = "Submits ReleaseGuard statements to the existing Flink region"
+  description  = "Submits ReleaseGuard statements to the target Flink region"
 }
 
 resource "confluent_role_binding" "manager_environment_admin" {
@@ -80,10 +93,28 @@ resource "confluent_role_binding" "flink_assigner" {
   crn_pattern = "${data.confluent_organization.current.resource_name}/service-account=${confluent_service_account.flink_app.id}"
 }
 
-resource "confluent_role_binding" "flink_cluster_admin" {
+resource "confluent_role_binding" "flink_topic_read" {
   principal   = "User:${confluent_service_account.flink_app.id}"
-  role_name   = "CloudClusterAdmin"
-  crn_pattern = data.confluent_kafka_cluster.target.rbac_crn
+  role_name   = "DeveloperRead"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/topic=releaseguard_*"
+}
+
+resource "confluent_role_binding" "flink_topic_write" {
+  principal   = "User:${confluent_service_account.flink_app.id}"
+  role_name   = "DeveloperWrite"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/topic=releaseguard_*"
+}
+
+resource "confluent_role_binding" "flink_transaction_read" {
+  principal   = "User:${confluent_service_account.flink_app.id}"
+  role_name   = "DeveloperRead"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/transactional-id=_confluent-flink_*"
+}
+
+resource "confluent_role_binding" "flink_transaction_write" {
+  principal   = "User:${confluent_service_account.flink_app.id}"
+  role_name   = "DeveloperWrite"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/transactional-id=_confluent-flink_*"
 }
 
 resource "confluent_role_binding" "flink_sr_read" {
@@ -107,19 +138,19 @@ resource "confluent_role_binding" "runtime_sr_read" {
 resource "confluent_role_binding" "runtime_topic_read" {
   principal   = "User:${confluent_service_account.runtime.id}"
   role_name   = "DeveloperRead"
-  crn_pattern = "${data.confluent_kafka_cluster.target.rbac_crn}/kafka=${data.confluent_kafka_cluster.target.id}/topic=releaseguard_*"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/topic=releaseguard_*"
 }
 
 resource "confluent_role_binding" "runtime_topic_write" {
   principal   = "User:${confluent_service_account.runtime.id}"
   role_name   = "DeveloperWrite"
-  crn_pattern = "${data.confluent_kafka_cluster.target.rbac_crn}/kafka=${data.confluent_kafka_cluster.target.id}/topic=releaseguard_*"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/topic=releaseguard_*"
 }
 
 resource "confluent_role_binding" "runtime_group_read" {
   principal   = "User:${confluent_service_account.runtime.id}"
   role_name   = "DeveloperRead"
-  crn_pattern = "${data.confluent_kafka_cluster.target.rbac_crn}/kafka=${data.confluent_kafka_cluster.target.id}/group=releaseguard_*"
+  crn_pattern = "${confluent_kafka_cluster.target.rbac_crn}/kafka=${confluent_kafka_cluster.target.id}/group=releaseguard_*"
 }
 
 resource "confluent_api_key" "manager_kafka" {
@@ -130,9 +161,9 @@ resource "confluent_api_key" "manager_kafka" {
     kind        = confluent_service_account.manager.kind
   }
   managed_resource {
-    id          = data.confluent_kafka_cluster.target.id
-    api_version = data.confluent_kafka_cluster.target.api_version
-    kind        = data.confluent_kafka_cluster.target.kind
+    id          = confluent_kafka_cluster.target.id
+    api_version = confluent_kafka_cluster.target.api_version
+    kind        = confluent_kafka_cluster.target.kind
     environment { id = var.environment_id }
   }
   depends_on = [confluent_role_binding.manager_environment_admin]
@@ -162,9 +193,9 @@ resource "confluent_api_key" "runtime_kafka" {
     kind        = confluent_service_account.runtime.kind
   }
   managed_resource {
-    id          = data.confluent_kafka_cluster.target.id
-    api_version = data.confluent_kafka_cluster.target.api_version
-    kind        = data.confluent_kafka_cluster.target.kind
+    id          = confluent_kafka_cluster.target.id
+    api_version = confluent_kafka_cluster.target.api_version
+    kind        = confluent_kafka_cluster.target.kind
     environment { id = var.environment_id }
   }
   depends_on = [confluent_role_binding.runtime_topic_read, confluent_role_binding.runtime_topic_write, confluent_role_binding.runtime_group_read]
@@ -204,10 +235,10 @@ resource "confluent_api_key" "flink" {
 
 resource "confluent_kafka_topic" "releaseguard" {
   for_each = local.all_topics
-  kafka_cluster { id = data.confluent_kafka_cluster.target.id }
+  kafka_cluster { id = confluent_kafka_cluster.target.id }
   topic_name       = each.key
   partitions_count = each.value.partitions
-  rest_endpoint    = data.confluent_kafka_cluster.target.rest_endpoint
+  rest_endpoint    = confluent_kafka_cluster.target.rest_endpoint
   config           = { "cleanup.policy" = "delete", "retention.ms" = each.value.retention }
   credentials {
     key    = confluent_api_key.manager_kafka.id
@@ -272,12 +303,12 @@ resource "confluent_flink_statement" "window_health" {
   statement_name = "releaseguard_window_health_v1"
   organization { id = data.confluent_organization.current.id }
   environment { id = var.environment_id }
-  compute_pool { id = var.flink_compute_pool_id }
+  compute_pool { id = confluent_flink_compute_pool.target.id }
   principal { id = confluent_service_account.flink_app.id }
   statement = file("${path.module}/../flink/01_releaseguard_window_health.sql")
   properties = {
     "sql.current-catalog"  = data.confluent_environment.target.display_name
-    "sql.current-database" = data.confluent_kafka_cluster.target.display_name
+    "sql.current-database" = confluent_kafka_cluster.target.display_name
     "sql.local-time-zone"  = "UTC"
   }
   rest_endpoint = data.confluent_flink_region.target.rest_endpoint
@@ -285,7 +316,16 @@ resource "confluent_flink_statement" "window_health" {
     key    = confluent_api_key.flink.id
     secret = confluent_api_key.flink.secret
   }
-  depends_on = [confluent_kafka_topic.releaseguard, confluent_subject_config.value, confluent_role_binding.flink_cluster_admin, confluent_role_binding.flink_sr_read, confluent_role_binding.flink_sr_write]
+  depends_on = [
+    confluent_kafka_topic.releaseguard,
+    confluent_subject_config.value,
+    confluent_role_binding.flink_topic_read,
+    confluent_role_binding.flink_topic_write,
+    confluent_role_binding.flink_transaction_read,
+    confluent_role_binding.flink_transaction_write,
+    confluent_role_binding.flink_sr_read,
+    confluent_role_binding.flink_sr_write,
+  ]
 }
 
 resource "confluent_flink_statement" "release_decisions" {
@@ -293,12 +333,12 @@ resource "confluent_flink_statement" "release_decisions" {
   statement_name = "releaseguard_release_decisions_v1"
   organization { id = data.confluent_organization.current.id }
   environment { id = var.environment_id }
-  compute_pool { id = var.flink_compute_pool_id }
+  compute_pool { id = confluent_flink_compute_pool.target.id }
   principal { id = confluent_service_account.flink_app.id }
   statement = file("${path.module}/../flink/02_releaseguard_release_decisions.sql")
   properties = {
     "sql.current-catalog"  = data.confluent_environment.target.display_name
-    "sql.current-database" = data.confluent_kafka_cluster.target.display_name
+    "sql.current-database" = confluent_kafka_cluster.target.display_name
     "sql.local-time-zone"  = "UTC"
   }
   rest_endpoint = data.confluent_flink_region.target.rest_endpoint
@@ -312,13 +352,14 @@ resource "confluent_flink_statement" "release_decisions" {
 resource "confluent_connector" "http_sink" {
   count = var.enable_http_sink ? 1 : 0
   environment { id = var.environment_id }
-  kafka_cluster { id = data.confluent_kafka_cluster.target.id }
+  kafka_cluster { id = confluent_kafka_cluster.target.id }
   config_sensitive = { "bearer.token" = var.webhook_bearer_token }
   config_nonsensitive = {
     "connector.class"                               = "HttpSinkV2"
     "name"                                          = "releaseguard_http_sink_v2"
     "topics"                                        = "releaseguard_release_decisions"
     "api1.topics"                                   = "releaseguard_release_decisions"
+    "apis.num"                                      = "1"
     "input.data.format"                             = "AVRO"
     "schema.context.name"                           = "default"
     "value.subject.name.strategy"                   = "TopicNameStrategy"
@@ -352,6 +393,10 @@ resource "confluent_connector" "http_sink" {
     precondition {
       condition     = startswith(var.public_backend_base_url, "https://") && length(var.webhook_bearer_token) >= 24
       error_message = "Enable HTTP Sink only with an HTTPS tunnel URL and a bearer token of at least 24 characters."
+    }
+    precondition {
+      condition     = !var.enable_http_sink || var.enable_flink
+      error_message = "HTTP Sink V2 requires the ReleaseGuard Flink statements."
     }
   }
   depends_on = [confluent_flink_statement.release_decisions, confluent_kafka_topic.releaseguard]

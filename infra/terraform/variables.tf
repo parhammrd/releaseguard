@@ -11,18 +11,32 @@ variable "confluent_cloud_api_secret" {
 }
 
 variable "environment_id" {
-  type    = string
-  default = "env-v91nqz"
+  description = "Existing Confluent environment that will contain only ReleaseGuard resources."
+  type        = string
+  default     = "env-g2k97n"
 }
 
-variable "kafka_cluster_id" {
-  type    = string
-  default = "lkc-nvxppj3"
+variable "cloud" {
+  description = "Cloud provider for the ReleaseGuard Kafka cluster and Flink pool."
+  type        = string
+  default     = "AWS"
 }
 
-variable "flink_compute_pool_id" {
-  type    = string
-  default = "lfcp-38w66xm"
+variable "region" {
+  description = "Cloud region for the ReleaseGuard Kafka cluster and Flink pool."
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "flink_max_cfu" {
+  description = "Maximum autoscaling capacity for the two ReleaseGuard Flink statements."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = contains([5, 10, 20, 30, 40, 50], var.flink_max_cfu)
+    error_message = "flink_max_cfu must be one of 5, 10, 20, 30, 40, or 50."
+  }
 }
 
 variable "enable_flink" {
